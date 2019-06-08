@@ -1,0 +1,211 @@
+from ctypes import *
+from FnLibrary import *
+import scipy.sparse as sp
+import scipy.linalg as lg
+import sys
+from scipy.optimize import basinhopping
+import numpy.random as nrm
+import random as rm
+import time
+from numpy import pi
+
+start_time = time.time()
+
+class MaxTimeBounds(object):
+     def __init__(self, xmax=[2*pi]*2, xmin=[0]*2,T=10):
+         self.xmax = np.array(xmax)
+         self.xmin = np.array(xmin)
+         self.T    = T
+     def __call__(self, **kwargs):
+         x = kwargs["x_new"]
+         tmax = bool(np.all(x <= self.xmax))
+         tmin = bool(np.all(x >= self.xmin))
+         Ttotal  = bool(sum(abs(x)) <= self.T)
+         return tmax and tmin and Ttotal
+
+# Manually define the state struct in python
+class state(Structure):
+    _fields_ = [('n', c_int),
+                ('N',c_int),
+                ('realcur',POINTER(c_double)),
+                ('imagcur',POINTER(c_double)),
+                ('realbuf',POINTER(c_double)),
+                ('imagbuf',POINTER(c_double))]
+class ham(Structure):
+    _fields_ = [('n',c_int),
+                ('N',c_int),
+                ('zzc',POINTER(c_double)),
+                ('xc',POINTER(c_double)),
+                ('zc',POINTER(c_double))]
+
+# Load c functions in qaoa
+qc      = cdll.LoadLibrary('./lib2local-qaoa.so')
+
+# Read in parameters
+n       = int(sys.argv[1])
+N       = 1<<n
+alpha   = float(sys.argv[2])
+Xcoeff  = float(sys.argv[3])
+Zcoeff  = float(sys.argv[4])
+p       = int(sys.argv[5])
+Tmax    = 10.0
+
+# Ctype the necessary parameters
+alphaC  = c_double(alpha)
+XcoeffC = c_double(Xcoeff)
+ZcoeffC = c_double(Zcoeff)
+TmaxC   = c_double(Tmax)
+
+# Initialize state and hamiltonian
+psi     = state()
+H       = ham()
+ppsi    = pointer(psi)
+ph      = pointer(H)
+qc.allocate(ppsi,n)
+qc.allocateH(ph,n)
+
+# Set input and return types
+qc.expectH.restype  = c_double
+qc.overlap.resype   = c_double
+qc.energy.restype   = c_double
+qc.qaoa1energy.restype = c_double
+
+# Hamiltonian Input
+
+# OPTION 1: Generate long-range power-law Hamiltonian
+#qc.lr(ph, ZcoeffC, XcoeffC, alphaC)
+#H.zc = (c_double * n)(*([-0.00]*n))
+
+# OPTION 2: Read in actual Hamiltonian parameters
+Jij = np.loadtxt('expJ-n%d.dat'%n)
+H.zzc = (c_double * n**2)(*Jij.flatten().tolist())
+H.xc  = (c_double * n)(*([0.02*Xcoeff]*n))
+H.zc  = (c_double * n)(*([0.0]*n))
+
+
+# Now we'll build the Hamiltonian (call it Ham) from the efficient description stored in H
+# [NOTE: This part can be sped up considerably, if one can use H directly to compute
+# the ground state energy and eigenstate ...]
+
+# First, the diagonal piece
+energies= map(lambda i:qc.energy(i,ph), range(N))
+Ham     = np.diag(energies)
+
+# Then, the off-diagonal terms
+for i in range(N):
+    for j in range(n):
+        Ham[i,i^(1<<j)] = H.xc[j]
+
+# Diagonalize the low-energy sector
+Neigs   = 2
+val,vec = sp.linalg.eigsh(Ham, k=Neigs, which='SA')
+#print val
+#print vec
+
+######################################################################
+# This part focuses on optimizing and comparing with the true ground state of the Hamiltonian
+
+# Define the function that initializes psi, then runs the given qaoa on it, and returns energy.
+def QAOApEnergy(betagamma): #betagamma = all betas first, then all gammas
+    qc.uniform(ppsi)
+    qc.evolveQAOA(ppsi, ph, (c_double * p)(*betagamma[:p]), (c_double * p)(*betagamma[p:]), p)
+    return qc.expectH(psi, ph)
+
+# Optimize!
+
+# Good initial guess for anti-aligned
+#Bopt    = 0#-0.68
+#Gopt    = 1.8#3.597
+# Good initial guess for aligned
+Bopt    = 0.309959993
+Gopt    = 0.17179375
+
+# Good initial guesses for higher p
+p1 = [0.2924, 0.4315]
+p2 = [0.4185, 0.1865, 0.3529, 0.8139]
+p3 = [0.43539926, 0.27324353, 0.14538042, 0.30558631, 0.6700184, 0.78849091]
+p4 = [0.45390907, 0.29103633, 0.23257216, 0.12405585, 0.27716268, 0.62436158, 0.74940894, 0.84993107]
+p5 = [0.46317968, 0.29802301, 0.24372751, 0.20629247, 0.11489144, 0.26697192, 0.58830666, 0.70542364, 0.81840803, 0.84517936]
+p6 = [0.45854223, 0.29470975, 0.24158609, 0.20680508, 0.18789287, 0.10335835, 0.25159215, 0.55154299, 0.66140737, 0.75624311, 0.80948166, 0.82349645]
+p7=  [0.48169834, 0.30839845, 0.24703166, 0.21090683, 0.19282329, 0.17710398, 0.09338242, 0.23007352, 0.52521174, 0.63209755, 0.72529467, 0.770095, 0.82088263, 0.82188806]
+
+maxTbound = MaxTimeBounds([pi/2]*p+[pi]*p,[-pi/2]*p + [-pi]*p,Tmax)
+#opt     = minimize(QAOApEnergy, [0.3,0.17]*p, method='Nelder-Mead')
+opt     = minimize(QAOApEnergy, p7[:7]+[p7[7]]+p7[7:]+[p7[-1]], method='Nelder-Mead')
+#opt     = minimize(QAOApEnergy,[-1.1251454,2.5751275,-0.62613113,0.20889732,0.11983374,0.2749234,0.83135125,-0.10419499,1.05854613,0.91987718], method='Nelder-Mead')
+#opt     = basinhopping(QAOApEnergy, [Bopt]*p + [Gopt]*p, niter=10, T=5.0)#,accept_test=maxTbound)
+copt    = opt.x.tolist()
+# Prepare the state under the optimized protocol
+qc.uniform(ppsi)
+qc.evolveQAOA(ppsi,ph , (c_double * p)(*copt[:p]), (c_double * p)(*copt[p:]), p)
+#qc.evolveQAOA(ppsi, ph, (c_double * p)(*[Bopt]), (c_double * p)(*[Gopt]), p)
+#optE = qc.expectH(psi, ph)
+
+# Compute state overlap
+real    = 0
+imag    = 0
+mag     = 0
+for k in range(Neigs):
+    for i in range(N):
+        real += np.real(vec[i,k])*psi.realcur[i] + np.imag(vec[i,k])*psi.imagcur[i] 
+        imag += np.real(vec[i,k])*psi.imagcur[i] - np.imag(vec[i,k])*psi.realcur[i]
+    mag+= real*real + imag*imag
+    real= 0
+    imag= 0
+# Compute overlap of final state with initial state
+mag0    = 0
+real0   = 0
+imag0   = 0
+for i in range(N):
+    real0 += psi.realcur[i] 
+    imag0 += psi.imagcur[i] 
+mag0   += real0*real0 + imag0*imag0
+mag0   /= float(N)
+
+# Compute overlap of GS with initial state
+mag1    = 0
+real1   = 0
+imag1   = 0
+for k in range(Neigs-1):
+    for i in range(N):
+        real1 += np.real(vec[i,k])
+        imag1 += np.imag(vec[i,k])
+    mag1+= real1*real1 + imag1*imag1
+    real1= 0
+    imag1= 0
+mag1   /= float(N)
+
+# Print the results
+print "%5.4f %5.4f %5.4f %5.4f %5.4f %5.4f %5.4f %5.4f"%(opt.x[0], opt.x[1],opt.fun, val[0], np.abs(opt.fun/(val[0])), np.sqrt(mag), np.sqrt(mag0), np.sqrt(mag1))
+print opt.x
+#print qc.qaoa1energy(c_double(opt.x[0]),c_double(opt.x[1]),ph)
+
+#print np.abs(optE/val[0]), np.sqrt(mag)
+
+# Print execution time
+#print time.time() - start_time
+
+
+##### ENTANGLEMENT ENTROPY ##########
+
+# True Ground state
+#Symmetrize the vectors, since this is the "true ground state" 
+#sym0 = vec[:,0]+ vec[::-1,0]
+#sym1 = vec[:,1]+ vec[::-1,1]
+#theta = 0.5*np.arcsin(0.5*np.vdot(sym1,sym0))
+#symvec= sym0/(2*np.cos(theta))
+
+# Final State post-QAOA
+#finalState = np.array([0.0 + 0.0j]*N)
+#for i in range(N):
+#     finalState[i] = psi.realcur[i]+psi.imagcur[i]*1.0j
+
+#for i in range(1,n):
+#     print entent(finalState,i)
+
+# GOOD STARTING ANGLES FOR p=1,..,5, n=10 (EXPERIMENTAL) AND B=-0.12
+#[-1.27835769  0.43147252]
+#[-1.98927531 -0.18650253 -0.35285592 -0.81386226]
+#[ 5.14116214  3.40816441  0.14380118  0.31642268  0.69776116  0.83360092]
+#[ 0.44594697  0.28371909  0.22557531  0.12288065  0.2880352   0.6486994  0.78251868  0.90168904]
+#[-1.1251454   2.5751275  -0.62613113  0.20889732  0.11983374  0.2749234  0.83135125 -0.10419499  1.05854613  0.91987718]

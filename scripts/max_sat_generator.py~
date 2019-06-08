@@ -1,0 +1,19 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import random as rm
+import numpy.random as nrm
+
+N = 10  # Number of bits
+M = 50  # Number of clauses
+K = 2   # Max-K-sat
+
+# Generate a max-sat instance. Randomly select k-tuples of bits, assign
+# a sign to each bit (to indicate negation), and create a clause from
+# the k bits. Do this M times.
+A = []  # H = A_i*z_i + B_ij*z_i*z_j
+B = []
+
+for i in range(M):
+    clause = rm.sample(range(1,N+1),K)
+    
+    
